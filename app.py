@@ -1,9 +1,11 @@
+import os
 import streamlit as st
 
 from utils.vector_db import get_collection
 from utils.retriever import semantic_search
 from utils.prompt_builder import build_prompt
 from utils.openrouter_llm import generate_answer
+from build_knowledge import build_knowledge_base
 
 
 st.set_page_config(
@@ -370,8 +372,40 @@ TOP_K = 4
 @st.cache_resource(show_spinner=False)
 def load_collection():
     try:
-        return get_collection()
-    except Exception:
+        collection = get_collection()
+
+        # If the deployed/local Chroma collection is empty,
+        # automatically build it from the PDFs in data/.
+        if collection.count() == 0:
+
+            data_folder = "data"
+            pdf_files = []
+
+            if os.path.exists(data_folder):
+                pdf_files = [
+                    file
+                    for file in os.listdir(data_folder)
+                    if file.lower().endswith(".pdf")
+                ]
+
+            if pdf_files:
+                with st.spinner(
+                    f"Building healthcare knowledge base from {len(pdf_files)} PDFs..."
+                ):
+                    build_knowledge_base()
+
+                # Reload after the builder recreates the Chroma collection.
+                collection = get_collection()
+
+        return collection
+
+    except Exception as e:
+        print("=" * 60)
+        print("KNOWLEDGE BASE ERROR")
+        print("=" * 60)
+        print(type(e).__name__)
+        print(repr(e))
+        print("=" * 60)
         return None
 
 
@@ -416,7 +450,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if collection is not None:
+    if collection is not None and collection.count() > 0:
         st.markdown(
             """
             <div class="sidebar-card">
