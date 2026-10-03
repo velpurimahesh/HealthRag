@@ -1,11 +1,20 @@
+import io
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import streamlit as st
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 from utils.vector_db import get_collection
 from utils.retriever import semantic_search
 from utils.prompt_builder import build_prompt
 from utils.openrouter_llm import generate_answer
-from build_knowledge import build_knowledge_base
 
 
 st.set_page_config(
@@ -372,40 +381,8 @@ TOP_K = 4
 @st.cache_resource(show_spinner=False)
 def load_collection():
     try:
-        collection = get_collection()
-
-        # If the deployed/local Chroma collection is empty,
-        # automatically build it from the PDFs in data/.
-        if collection.count() == 0:
-
-            data_folder = "data"
-            pdf_files = []
-
-            if os.path.exists(data_folder):
-                pdf_files = [
-                    file
-                    for file in os.listdir(data_folder)
-                    if file.lower().endswith(".pdf")
-                ]
-
-            if pdf_files:
-                with st.spinner(
-                    f"Building healthcare knowledge base from {len(pdf_files)} PDFs..."
-                ):
-                    build_knowledge_base()
-
-                # Reload after the builder recreates the Chroma collection.
-                collection = get_collection()
-
-        return collection
-
-    except Exception as e:
-        print("=" * 60)
-        print("KNOWLEDGE BASE ERROR")
-        print("=" * 60)
-        print(type(e).__name__)
-        print(repr(e))
-        print("=" * 60)
+        return get_collection()
+    except Exception:
         return None
 
 
@@ -414,6 +391,42 @@ collection = load_collection()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "composer_text" not in st.session_state:
+    st.session_state.composer_text = ""
+if "pending_transcript" not in st.session_state:
+    st.session_state.pending_transcript = None
+if "last_audio_signature" not in st.session_state:
+    st.session_state.last_audio_signature = None
+
+def get_openai_client():
+    if OpenAI is None:
+        return None
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
+
+def transcribe_audio(audio_file):
+    client = get_openai_client()
+    if client is None:
+        return None, "Voice transcription is not configured. Add OPENAI_API_KEY to your .env file or Streamlit Secrets."
+    try:
+        audio_buffer = io.BytesIO(audio_file.getvalue())
+        audio_buffer.name = "healthrag_audio.wav"
+        result = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=audio_buffer,
+        )
+        text = getattr(result, "text", "") or ""
+        return text.strip(), None
+    except Exception as exc:
+        return None, f"Voice transcription failed: {exc}"
 
 
 def new_chat():
@@ -450,7 +463,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if collection is not None and collection.count() > 0:
+    if collection is not None:
         st.markdown(
             """
             <div class="sidebar-card">
@@ -598,17 +611,65 @@ for message in st.session_state.messages:
 
 
 # ============================================================
-# CHAT INPUT
+# CHAT INPUT + VOICE COMPOSER
 # ============================================================
 
-user_question = st.chat_input("Ask a healthcare question...")
+# Apply a transcript before creating the widget so the user can edit it.
+if st.session_state.pending_transcript is not None:
+    st.session_state.composer_text = st.session_state.pending_transcript
+    st.session_state.pending_transcript = None
+
+composer_col, mic_col, send_col = st.columns(
+    [10, 1.15, 1.15],
+    vertical_alignment="bottom",
+)
+
+with composer_col:
+    composer_text = st.text_input(
+        "Message",
+        value=st.session_state.composer_text,
+        key="healthrag_composer_text",
+        placeholder="Ask HealthRAG a healthcare question...",
+        label_visibility="collapsed",
+    )
+    st.session_state.composer_text = composer_text
+
+with mic_col:
+    audio_input = st.audio_input(
+        "🎤",
+        key="healthrag_composer_microphone",
+        label_visibility="collapsed",
+    )
+
+with send_col:
+    send_clicked = st.button(
+        "↑",
+        key="healthrag_send",
+        use_container_width=True,
+        type="primary",
+        help="Send message",
+    )
+
+if audio_input is not None:
+    audio_signature = hash(audio_input.getvalue())
+    if st.session_state.last_audio_signature != audio_signature:
+        st.session_state.last_audio_signature = audio_signature
+        with st.spinner("Converting your voice to text..."):
+            transcribed_text, error = transcribe_audio(audio_input)
+        if error:
+            st.error(error)
+        elif transcribed_text:
+            st.session_state.pending_transcript = transcribed_text
+            st.rerun()
 
 
 # ============================================================
 # PROCESS QUESTION
 # ============================================================
 
-if user_question:
+user_question = st.session_state.composer_text.strip() if send_clicked else ""
+
+if send_clicked:
 
     st.session_state.messages.append(
         {
@@ -718,7 +779,7 @@ if user_question:
             "content": answer,
         }
     )
-
+    st.session_state.composer_text = ""
     st.rerun()
 
 
